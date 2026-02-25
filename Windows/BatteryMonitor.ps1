@@ -1,5 +1,15 @@
 # Battery Monitor Script - Notifies when battery > 90% and plugged in
+# Runs silently in background
 Add-Type -AssemblyName System.Windows.Forms
+
+# Hide console window
+$showWindowAsync = Add-Type -MemberDefinition @"
+[DllImport("user32.dll")]
+public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+"@ -Name "Win32ShowWindowAsync" -PassThru
+
+$consoleHandle = Get-Process -Id $PID | Select-Object -ExpandProperty MainWindowHandle
+$showWindowAsync::ShowWindowAsync($consoleHandle, 0) | Out-Null
 
 function Show-BatteryNotification {
     param([string]$Message)
@@ -27,10 +37,7 @@ function Get-BatteryStatus {
     }
 }
 
-# Main monitoring loop
-Write-Host "Battery monitor started. Press Ctrl+C to stop."
-Write-Host "Monitoring for battery > 90% while plugged in..."
-
+# Main monitoring loop - runs silently
 $lastNotificationTime = 0
 $notificationCooldown = 300 # 5 minutes between notifications
 
@@ -39,13 +46,10 @@ try {
         $status = Get-BatteryStatus
         $currentTime = [int][double]::Parse((Get-Date -UFormat %s))
         
-        Write-Host "Battery: $($status.Percent)% | Plugged In: $($status.IsPluggedIn)"
-        
         if ($status.Percent -gt 90 -and $status.IsPluggedIn) {
             if ($currentTime - $lastNotificationTime -gt $notificationCooldown) {
                 $message = "Battery is $($status.Percent)% and still plugged in. Consider unplugging to preserve battery health."
                 Show-BatteryNotification -Message $message
-                Write-Host "NOTIFICATION SENT: $message"
                 $lastNotificationTime = $currentTime
             }
         }
@@ -54,5 +58,5 @@ try {
     }
 }
 catch {
-    Write-Host "Battery monitor stopped."
+    # Silent error handling
 }
