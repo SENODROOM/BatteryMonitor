@@ -1,15 +1,17 @@
 # Battery Monitor Script - Notifies when battery > 90% and plugged in
 # Runs silently in background
 Add-Type -AssemblyName System.Windows.Forms
+try { Add-Type -AssemblyName System.Windows.Forms } catch {}
 
 # Hide console window
+try {
 $showWindowAsync = Add-Type -MemberDefinition @"
 [DllImport("user32.dll")]
 public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
 "@ -Name "Win32ShowWindowAsync" -PassThru
-
 $consoleHandle = Get-Process -Id $PID | Select-Object -ExpandProperty MainWindowHandle
 $showWindowAsync::ShowWindowAsync($consoleHandle, 0) | Out-Null
+} catch {}
  
 $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $runName = "BatteryMonitor"
@@ -17,6 +19,9 @@ $runValue = "c:\Programming\BatteryMonitor\Windows\BatteryMonitorStartup.bat"
 $existing = $null
 try { $existing = (Get-ItemProperty -Path $runKey -Name $runName -ErrorAction SilentlyContinue).$runName } catch {}
 if (-not $existing -or $existing -ne $runValue) { New-ItemProperty -Path $runKey -Name $runName -Value $runValue -PropertyType String -Force | Out-Null }
+ 
+$mutex = New-Object System.Threading.Mutex($false,"BatteryMonitorMutex")
+if (-not $mutex.WaitOne(0,$false)) { exit }
 
 function Show-BatteryNotification {
     param([string]$Message)
@@ -34,11 +39,33 @@ function Show-BatteryNotification {
     $notification.Dispose()
 }
 
+function Show-Notification {
+    param([string]$Message)
+    try {
+        $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+        $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime]
+        $appId = "BatteryMonitor.PowerShell"
+        $xml = "<toast><visual><binding template='ToastGeneric'><text>Battery Alert</text><text>$Message</text></binding></visual></toast>"
+        $xmlDoc = New-Object Windows.Data.Xml.Dom.XmlDocument
+        $xmlDoc.LoadXml($xml)
+        $toast = [Windows.UI.Notifications.ToastNotification]::new($xmlDoc)
+        $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId)
+        $notifier.Show($toast)
+    }
+    catch {
+        Show-BatteryNotification -Message $Message
+    }
+}
+
 function Get-BatteryStatus {
     try {
         $ps = [System.Windows.Forms.SystemInformation]::PowerStatus
         $percent = [math]::Round($ps.BatteryLifePercent * 100)
         $isPluggedIn = ($ps.PowerLineStatus.ToString() -eq "Online")
+        try {
+            $wmiStatus = Get-CimInstance -Namespace root\wmi -ClassName BatteryStatus -ErrorAction SilentlyContinue
+            if ($wmiStatus) { $isPluggedIn = $isPluggedIn -or $wmiStatus.PowerOnline }
+        } catch {}
         return @{
             Percent = $percent
             IsPluggedIn = $isPluggedIn
@@ -73,8 +100,9 @@ try {
         if ($status.Percent -ge 90 -and $status.IsPluggedIn) {
             if ($currentTime - $lastNotificationTime -gt $notificationCooldown) {
                 $message = "Battery is $($status.Percent)% and still plugged in. Consider unplugging to preserve battery health."
-                Show-BatteryNotification -Message $message
+                Show-Notification -Message $message
                 $lastNotificationTime = $currentTime
+                try { Add-Content -Path ([System.IO.Path]::Combine([System.IO.Path]::GetTempPath(),"BatteryMonitor.log")) -Value ("Notified at {0}: {1}%" -f (Get-Date), $status.Percent) } catch {}
             }
         }
         
