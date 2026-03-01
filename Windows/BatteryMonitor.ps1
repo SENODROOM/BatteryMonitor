@@ -10,6 +10,13 @@ public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
 
 $consoleHandle = Get-Process -Id $PID | Select-Object -ExpandProperty MainWindowHandle
 $showWindowAsync::ShowWindowAsync($consoleHandle, 0) | Out-Null
+ 
+$runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+$runName = "BatteryMonitor"
+$runValue = "c:\Programming\BatteryMonitor\Windows\BatteryMonitorStartup.bat"
+$existing = $null
+try { $existing = (Get-ItemProperty -Path $runKey -Name $runName -ErrorAction SilentlyContinue).$runName } catch {}
+if (-not $existing -or $existing -ne $runValue) { New-ItemProperty -Path $runKey -Name $runName -Value $runValue -PropertyType String -Force | Out-Null }
 
 function Show-BatteryNotification {
     param([string]$Message)
@@ -28,12 +35,29 @@ function Show-BatteryNotification {
 }
 
 function Get-BatteryStatus {
-    $battery = Get-CimInstance -ClassName Win32_Battery
-    $powerLineStatus = (Get-CimInstance -Namespace root\wmi -ClassName BatteryStatus).PowerOnline
-    
-    return @{
-        Percent = $battery.EstimatedChargeRemaining
-        IsPluggedIn = ($battery.BatteryStatus -eq 2) -or $powerLineStatus
+    try {
+        $ps = [System.Windows.Forms.SystemInformation]::PowerStatus
+        $percent = [math]::Round($ps.BatteryLifePercent * 100)
+        $isPluggedIn = ($ps.PowerLineStatus.ToString() -eq "Online")
+        return @{
+            Percent = $percent
+            IsPluggedIn = $isPluggedIn
+        }
+    }
+    catch {
+        try {
+            $battery = Get-CimInstance -ClassName Win32_Battery
+            return @{
+                Percent = $battery.EstimatedChargeRemaining
+                IsPluggedIn = ($battery.BatteryStatus -eq 2)
+            }
+        }
+        catch {
+            return @{
+                Percent = 0
+                IsPluggedIn = $false
+            }
+        }
     }
 }
 
@@ -46,7 +70,7 @@ try {
         $status = Get-BatteryStatus
         $currentTime = [int][double]::Parse((Get-Date -UFormat %s))
         
-        if ($status.Percent -gt 90 -and $status.IsPluggedIn) {
+        if ($status.Percent -ge 90 -and $status.IsPluggedIn) {
             if ($currentTime - $lastNotificationTime -gt $notificationCooldown) {
                 $message = "Battery is $($status.Percent)% and still plugged in. Consider unplugging to preserve battery health."
                 Show-BatteryNotification -Message $message
