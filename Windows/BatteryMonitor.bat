@@ -1,2 +1,2 @@
 @echo off
-powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%~dp0BatteryMonitor.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File "%~dp0BatteryMonitor.ps1"

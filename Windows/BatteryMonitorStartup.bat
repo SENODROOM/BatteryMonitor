@@ -1,2 +1,3 @@
 @echo off
-powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%~dp0BatteryMonitor.ps1"
+:: Uses wscript to launch with absolutely no window flash at startup
+wscript.exe "%~dp0BatteryMonitorSilent.vbs"

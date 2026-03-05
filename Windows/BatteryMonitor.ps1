@@ -1,188 +1,151 @@
 # Battery Monitor Script
-# Runs silently in background and alerts when battery is >= 90% while charging.
-try { Add-Type -AssemblyName System.Windows.Forms } catch {}
+# Runs silently in background. Alerts via Windows toast when battery >= 90% while charging.
 
-$logPath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "BatteryMonitor.log")
-function Write-Log {
-    param([string]$Message)
-    try {
-        Add-Content -Path $logPath -Value ("{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $Message)
-    } catch {}
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# ── Hide any console window immediately ──────────────────────────────────────
+Add-Type -Name WinAPI -Namespace Native -MemberDefinition @"
+    [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+"@
+[Native.WinAPI]::ShowWindowAsync([Native.WinAPI]::GetConsoleWindow(), 0) | Out-Null
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+$logPath = "$env:TEMP\BatteryMonitor.log"
+function Write-Log([string]$msg) {
+    try { Add-Content -Path $logPath -Value ("{0:yyyy-MM-dd HH:mm:ss}  {1}" -f (Get-Date), $msg) } catch {}
 }
 
-# Hide console window
-try {
-$showWindowAsync = Add-Type -MemberDefinition @"
-[DllImport("user32.dll")]
-public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
-"@ -Name "Win32ShowWindowAsync" -PassThru
-$consoleHandle = Get-Process -Id $PID | Select-Object -ExpandProperty MainWindowHandle
-$showWindowAsync::ShowWindowAsync($consoleHandle, 0) | Out-Null
-} catch {}
- 
-$runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-$runName = "BatteryMonitor"
+# ── Single-instance guard (mutex) ────────────────────────────────────────────
+$mutex = New-Object System.Threading.Mutex($false, "Global\BatteryMonitorMutex")
+if (-not $mutex.WaitOne(0, $false)) {
+    Write-Log "Another instance already running. Exiting."
+    exit
+}
+Write-Log "Battery Monitor started."
+
+# ── Auto-start: add to HKCU Run key so it launches silently at every logon ───
 $scriptPath = $MyInvocation.MyCommand.Path
-$escapedScriptPath = $scriptPath.Replace('"', '""')
-$runValue = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$escapedScriptPath"""
-$existing = $null
-try { $existing = (Get-ItemProperty -Path $runKey -Name $runName -ErrorAction SilentlyContinue).$runName } catch {}
-if (-not $existing -or $existing -ne $runValue) { New-ItemProperty -Path $runKey -Name $runName -Value $runValue -PropertyType String -Force | Out-Null }
-Write-Log "Startup Run key ensured."
-
-# Also ensure startup via scheduled task for better reliability at sign-in.
+$runKey     = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+$runValue   = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$scriptPath`""
 try {
-    $taskName = "BatteryMonitor"
-    $taskAction = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`""
-    schtasks /Create /TN $taskName /SC ONLOGON /TR $taskAction /F | Out-Null
-    Write-Log "Scheduled task ensured."
+    Set-ItemProperty -Path $runKey -Name "BatteryMonitor" -Value $runValue -Force
+    Write-Log "Run key set."
 } catch {
-    Write-Log ("Scheduled task setup failed: {0}" -f $_.Exception.Message)
+    Write-Log "Run key failed: $($_.Exception.Message)"
 }
 
-$mutex = New-Object System.Threading.Mutex($false,"BatteryMonitorMutex")
-if (-not $mutex.WaitOne(0,$false)) { exit }
-Write-Log "Monitor started."
-
-function Show-BatteryNotification {
-    param([string]$Message)
-    
-    $notification = New-Object System.Windows.Forms.NotifyIcon
-    $notification.Icon = [System.Drawing.SystemIcons]::Information
-    $notification.BalloonTipTitle = "Battery Alert"
-    $notification.BalloonTipText = $Message
-    $notification.BalloonTipIcon = "Info"
-    $notification.Visible = $true
-    $notification.ShowBalloonTip(5000)
-    
-    # Clean up after showing
-    Start-Sleep -Seconds 6
-    $notification.Dispose()
-}
-
-function Show-Notification {
-    param([string]$Message)
-
-    # 1) Try a direct Windows session message (very visible).
+# ── Toast notification (no tray icon, no popup, no dialog) ───────────────────
+function Show-Toast([string]$title, [string]$body) {
     try {
-        & msg.exe * /TIME:8 "$Message" | Out-Null
-        Write-Log "MSG notification shown: $Message"
-        return
+        # Use Windows.UI.Notifications via WinRT COM bridge
+        $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+        $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime]
+
+        $xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(
+                    [Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+        $nodes = $xml.GetElementsByTagName("text")
+        $nodes.Item(0).AppendChild($xml.CreateTextNode($title)) | Out-Null
+        $nodes.Item(1).AppendChild($xml.CreateTextNode($body))  | Out-Null
+
+        $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(
+            "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe"
+        ).Show($toast)
+
+        Write-Log "Toast shown: $title | $body"
+        return $true
     } catch {
-        Write-Log ("MSG notification failed: {0}" -f $_.Exception.Message)
-    }
-
-    # 2) Try a popup dialog.
-    try {
-        $wshell = New-Object -ComObject WScript.Shell
-        $null = $wshell.Popup($Message, 8, "Battery Alert", 64)
-        Write-Log "Popup notification shown: $Message"
-        return
-    }
-    catch {
-        Write-Log ("Popup notification failed: {0}" -f $_.Exception.Message)
-    }
-
-    # 3) Last fallback: tray balloon.
-    try {
-        Show-BatteryNotification -Message $Message
-        Write-Log "Tray balloon notification shown: $Message"
-    } catch {
-        Write-Log ("All notification methods failed: {0}" -f $_.Exception.Message)
+        Write-Log "Toast failed: $($_.Exception.Message)"
+        return $false
     }
 }
 
+# Fallback: tray balloon (still silent — no popup/dialog)
+function Show-Balloon([string]$title, [string]$body) {
+    try {
+        $ni = New-Object System.Windows.Forms.NotifyIcon
+        $ni.Icon = [System.Drawing.SystemIcons]::Information
+        $ni.BalloonTipTitle = $title
+        $ni.BalloonTipText  = $body
+        $ni.BalloonTipIcon  = "Info"
+        $ni.Visible = $true
+        $ni.ShowBalloonTip(6000)
+        Start-Sleep -Seconds 7
+        $ni.Dispose()
+        Write-Log "Balloon shown: $title | $body"
+    } catch {
+        Write-Log "Balloon failed: $($_.Exception.Message)"
+    }
+}
+
+function Show-Notification([string]$title, [string]$body) {
+    if (-not (Show-Toast $title $body)) {
+        Show-Balloon $title $body
+    }
+}
+
+# ── Battery status ────────────────────────────────────────────────────────────
 function Get-BatteryStatus {
-    $percent = 0
-    $isPluggedIn = $false
-    $debug = @()
+    $percent    = 0
+    $isCharging = $false
 
+    # Primary: Win32_Battery (most reliable for charging state)
+    try {
+        $bat = Get-CimInstance Win32_Battery -ErrorAction Stop
+        if ($bat) {
+            $percent    = [int][math]::Round(($bat | Measure-Object EstimatedChargeRemaining -Average).Average)
+            # BatteryStatus 2 = Charging, 6 = Charging+High, 7 = Charging+Low, 8 = Charging+Critical
+            $isCharging = ($bat | Where-Object { $_.BatteryStatus -in 2,6,7,8,9,11 }).Count -gt 0
+        }
+    } catch { Write-Log "Win32_Battery error: $($_.Exception.Message)" }
+
+    # Cross-check with PowerStatus
     try {
         $ps = [System.Windows.Forms.SystemInformation]::PowerStatus
-        $p = [math]::Round($ps.BatteryLifePercent * 100)
-        if ($p -ge 0) { $percent = [int]$p }
-        $line = $ps.PowerLineStatus.ToString()
-        if ($line -eq "Online") { $isPluggedIn = $true }
-        $debug += "Forms:Percent=$percent,Line=$line"
-    } catch {
-        $debug += ("FormsErr={0}" -f $_.Exception.Message)
-    }
+        $pct = [int][math]::Round($ps.BatteryLifePercent * 100)
+        if ($pct -gt 0 -and $pct -le 100) { $percent = $pct }
+        if ($ps.PowerLineStatus -eq "Online") { $isCharging = $true }
+    } catch {}
 
-    try {
-        $batteries = Get-CimInstance -ClassName Win32_Battery -ErrorAction Stop
-        if ($batteries) {
-            $avg = [math]::Round((($batteries | Measure-Object -Property EstimatedChargeRemaining -Average).Average))
-            if ($avg -ge 0) { $percent = [int]$avg }
-            $statuses = @($batteries | ForEach-Object { [int]$_.BatteryStatus })
-            # Charging/plugged statuses in Win32_Battery docs.
-            if ($statuses | Where-Object { $_ -in 2,3,6,7,8,9,11 }) { $isPluggedIn = $true }
-            $debug += ("Win32:Percent={0},Status={1}" -f $percent, ($statuses -join ","))
-        }
-    } catch {
-        $debug += ("Win32Err={0}" -f $_.Exception.Message)
-    }
-
-    try {
-        $wmiStatus = Get-CimInstance -Namespace root\wmi -ClassName BatteryStatus -ErrorAction SilentlyContinue
-        if ($wmiStatus) {
-            if (@($wmiStatus | Where-Object { $_.PowerOnline }).Count -gt 0) { $isPluggedIn = $true }
-            $debug += ("WMI:PowerOnline={0}" -f ((@($wmiStatus | ForEach-Object { $_.PowerOnline }) -join ",")))
-        }
-    } catch {
-        $debug += ("WmiErr={0}" -f $_.Exception.Message)
-    }
-
-    return @{
-        Percent = $percent
-        IsPluggedIn = $isPluggedIn
-        Debug = ($debug -join " | ")
-    }
+    return @{ Percent = $percent; IsCharging = $isCharging }
 }
 
-# Main monitoring loop - runs silently
-$firstAlertSent = $false
-$secondAlertSent = $false
-$firstAlertTime = $null
-$lastSeenState = ""
+# ── Main loop ─────────────────────────────────────────────────────────────────
+$alertSentAt   = $null   # time first alert was sent for current charging session
+$reminderSent  = $false
 
 try {
     while ($true) {
-        $status = Get-BatteryStatus
-        $state = "P=$($status.Percent);C=$($status.IsPluggedIn);D=$($status.Debug)"
-        if ($state -ne $lastSeenState) {
-            Write-Log "State changed: $state"
-            $lastSeenState = $state
-        }
+        $s = Get-BatteryStatus
 
-        if ($status.Percent -ge 90 -and $status.IsPluggedIn) {
-            if (-not $firstAlertSent) {
-                $message = "Battery is $($status.Percent)% and still charging. Please unplug the charger."
-                Show-Notification -Message $message
-                $firstAlertSent = $true
-                $secondAlertSent = $false
-                $firstAlertTime = Get-Date
-                Write-Log ("First alert sent at {0}%" -f $status.Percent)
+        if ($s.Percent -ge 90 -and $s.IsCharging) {
+            if ($null -eq $alertSentAt) {
+                # First alert
+                Show-Notification "🔋 Unplug Charger" "Battery is at $($s.Percent)% and still charging. Please unplug."
+                $alertSentAt  = Get-Date
+                $reminderSent = $false
+                Write-Log "Alert 1 sent at $($s.Percent)%"
             }
-            elseif (-not $secondAlertSent -and $firstAlertTime -and (((Get-Date) - $firstAlertTime).TotalSeconds -ge 120)) {
-                $message = "Battery is still charging at $($status.Percent)% after 2 minutes. Please unplug now."
-                Show-Notification -Message $message
-                $secondAlertSent = $true
-                Write-Log ("Second alert sent at {0}%" -f $status.Percent)
+            elseif (-not $reminderSent -and ((Get-Date) - $alertSentAt).TotalMinutes -ge 5) {
+                # Reminder after 5 minutes if still charging
+                Show-Notification "🔋 Still Charging!" "Battery is at $($s.Percent)%. Unplug the charger to protect battery health."
+                $reminderSent = $true
+                Write-Log "Alert 2 (reminder) sent at $($s.Percent)%"
             }
         }
         else {
-            # Reset when charger is unplugged or battery drops below threshold.
-            if ($firstAlertSent -or $secondAlertSent) {
-                Write-Log "Alert state reset."
-            }
-            $firstAlertSent = $false
-            $secondAlertSent = $false
-            $firstAlertTime = $null
+            # Reset when unplugged or drops below 90%
+            if ($null -ne $alertSentAt) { Write-Log "Alert state reset (Percent=$($s.Percent), Charging=$($s.IsCharging))" }
+            $alertSentAt  = $null
+            $reminderSent = $false
         }
 
-        Start-Sleep -Seconds 30 # Check every 30 seconds
+        Start-Sleep -Seconds 60   # check every 60 seconds
     }
 }
 catch {
-    Write-Log ("Fatal loop error: {0}" -f $_.Exception.Message)
+    Write-Log "Fatal error: $($_.Exception.Message)"
+    $mutex.ReleaseMutex()
 }
